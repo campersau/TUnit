@@ -72,8 +72,24 @@ internal class SingleTestExecutor(
                 await WaitForDependsOnTests(test, filter, context);
                 
                 start = DateTimeOffset.Now;
-                
-                await ExecuteTest(test, testContext, filter, cleanUpExceptions);
+
+                if (!explicitFilterService.CanRun(test.TestDetails, filter))
+                {
+                    throw new SkipTestException("Test with ExplicitAttribute was not explicitly run.");
+                }
+
+                if (testContext.SkipReason != null)
+                {
+                    throw new SkipTestException(testContext.SkipReason);
+                }
+
+                await ExecuteStaticBeforeHooks(test);
+
+                TestContext.Current = testContext;
+
+                await ExecuteOnTestStartEvents(testContext);
+
+                await ExecuteWithRetries(test, cleanUpExceptions);
 
                 ExceptionsHelper.ThrowIfAny(cleanUpExceptions);
 
@@ -95,20 +111,21 @@ internal class SingleTestExecutor(
             }
             catch (SkipTestException skipTestException)
             {
+                var timingProperty = GetTimingProperty(testContext, start);
+
                 await logger.LogInformationAsync($"Skipping {testContext.GetClassTypeName()}.{testContext.GetTestDisplayName()}...");
 
                 await messageBus.Skipped(testContext, skipTestException.Reason);
 
-                var now = DateTimeOffset.Now;
-
                 testContext.Result = new TestResult
                 {
-                    Duration = TimeSpan.Zero,
-                    Start = timings.MinBy(x => x.Start)?.Start ?? now,
-                    End = timings.MinBy(x => x.End)?.End ?? timings.MinBy(x => x.Start)?.Start ?? now,
+                    Duration = timingProperty.GlobalTiming.Duration,
+                    Start = timingProperty.GlobalTiming.StartTime,
+                    End = timingProperty.GlobalTiming.EndTime,
                     ComputerName = Environment.MachineName,
                     Exception = null,
                     Status = Status.Skipped,
+                    Output = $"{testContext.GetErrorOutput()}{Environment.NewLine}{testContext.GetStandardOutput()}"
                 };
             }
             catch (Exception e)
@@ -130,113 +147,38 @@ internal class SingleTestExecutor(
 
                 throw;
             }
+            finally
+            {
+                if (testContext.Result?.Status != Status.Skipped)
+                {
+                    foreach (var testEndEventsObject in testContext.GetTestEndEventObjects())
+                    {
+                        await RunHelpers.RunValueTaskSafelyAsync(() => testEndEventsObject.OnTestEnd(testContext),
+                            cleanUpExceptions);
+                    }
+                }
+                else
+                {
+                    foreach (var testSkippedEventReceiver in testContext.GetTestSkippedEventObjects())
+                    {
+                        await RunHelpers.RunValueTaskSafelyAsync(() => testSkippedEventReceiver.OnTestSkipped(testContext),
+                            cleanUpExceptions);
+                    }
+                }
+
+                TestContext.Current = null;
+
+                await ExecuteStaticAfterHooks(test, testContext, cleanUpExceptions);
+
+                foreach (var artifact in testContext.Artifacts)
+                {
+                    await messageBus.TestArtifact(testContext, artifact);
+                }
+            }
         }
         finally
         {
             semaphore?.Release();
-        }
-    }
-
-    private void CheckCancelled()
-    {
-        if (engineCancellationToken.Token.IsCancellationRequested)
-        {
-            throw new SkipTestException("The test session has been cancelled...");
-        }
-        
-        if (cancellationTokenSource.IsCancellationRequested)
-        {
-            throw new SkipTestException("The test has been cancelled...");
-        }
-    }
-
-    private async Task ExecuteTest(DiscoveredTest test, TestContext testContext,
-        ITestExecutionFilter? filter,
-        List<Exception> cleanUpExceptions)
-    {
-        DateTimeOffset? start = null;
-
-        try
-        {
-            if (!explicitFilterService.CanRun(test.TestDetails, filter))
-            {
-                throw new SkipTestException("Test with ExplicitAttribute was not explicitly run.");
-            }
-
-            if (testContext.SkipReason != null)
-            {
-                throw new SkipTestException(testContext.SkipReason);
-            }
-                
-            CheckCancelled();
-
-            start = DateTimeOffset.Now;
-            
-            await ExecuteStaticBeforeHooks(test);
-
-            TestContext.Current = testContext;
-            
-            await ExecuteOnTestStartEvents(testContext);
-
-            await ExecuteWithRetries(test, cleanUpExceptions);
-
-            var timingProperty = GetTimingProperty(testContext, start.Value);
-
-            testContext.Result = new TestResult
-            {
-                Duration = timingProperty.GlobalTiming.Duration,
-                Start = timingProperty.GlobalTiming.StartTime,
-                End = timingProperty.GlobalTiming.EndTime,
-                ComputerName = Environment.MachineName,
-                Exception = null,
-                Status = Status.Passed,
-                Output = $"{testContext.GetErrorOutput()}{Environment.NewLine}{testContext.GetStandardOutput()}"
-            };
-        }
-        catch (Exception e)
-        {
-            var timingProperty = GetTimingProperty(testContext, start);
-
-            testContext.Result = new TestResult
-            {
-                Duration = timingProperty.GlobalTiming.Duration,
-                Start = timingProperty.GlobalTiming.StartTime,
-                End = timingProperty.GlobalTiming.EndTime,
-                ComputerName = Environment.MachineName,
-                Exception = e is SkipTestException ? null : e,
-                Status = e is SkipTestException ? Status.Skipped : Status.Failed,
-                Output = $"{testContext.GetErrorOutput()}{Environment.NewLine}{testContext.GetStandardOutput()}"
-            };
-
-            throw;
-        }
-        finally
-        {
-            if (testContext.Result?.Status != Status.Skipped)
-            {
-                foreach (var testEndEventsObject in testContext.GetTestEndEventObjects())
-                {
-                    await RunHelpers.RunValueTaskSafelyAsync(() => testEndEventsObject.OnTestEnd(testContext),
-                        cleanUpExceptions);
-                }
-            }
-            else
-            {
-                foreach (var testSkippedEventReceiver in testContext.GetTestSkippedEventObjects())
-                {
-                    await RunHelpers.RunValueTaskSafelyAsync(() => testSkippedEventReceiver.OnTestSkipped(testContext),
-                        cleanUpExceptions);
-                }
-            }
-            
-            TestContext.Current = null;
-            
-            await ExecuteStaticAfterHooks(test, testContext, cleanUpExceptions);
-
-            foreach (var artifact in testContext.Artifacts)
-            {
-                await messageBus.TestArtifact(testContext, artifact);
-            }
         }
     }
 
